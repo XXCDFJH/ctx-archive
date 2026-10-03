@@ -1,0 +1,113 @@
+{
+  "name": "ctx-archive",
+  "displayName": "Ctx Archive - append-only 上下文记录器",
+  "description": "以 append-only 方式归档 VS Code Copilot Chat 会话(聊天记录 + agent 操作),灵感来自 DeepSeek Harness 的会话持久化机制",
+  "version": "1.0.0-alpha",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ctxArchive.openPanel",
+        "title": "Ctx Archive: 打开图形回溯面板",
+        "icon": "$(history)"
+      },
+      {
+        "command": "ctxArchive.listSessions",
+        "title": "Ctx Archive: 列出已归档会话"
+      },
+      {
+        "command": "ctxArchive.exportMarkdown",
+        "title": "Ctx Archive: 导出会话为 Markdown"
+      },
+      {
+        "command": "ctxArchive.openArchiveFolder",
+        "title": "Ctx Archive: 打开归档目录"
+      },
+      {
+        "command": "ctxArchive.rebuildArchives",
+        "title": "Ctx Archive: 重建归档(提取工具结果)"
+      },
+      {
+        "command": "ctxArchive.toggleRecording",
+        "title": "Ctx Archive: 开启/暂停记录"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "ctxArchive.openPanel",
+        "key": "ctrl+alt+h",
+        "mac": "cmd+alt+h"
+      }
+    ],
+    "chatParticipants": [
+      {
+        "id": "ctxlog",
+        "name": "ctxlog",
+        "description": "记录开关与内容回溯:归档 Copilot Chat 会话(append-only),支持回溯/导出",
+        "commands": [
+          {
+            "name": "on",
+            "description": "开启记录"
+          },
+          {
+            "name": "off",
+            "description": "暂停记录"
+          },
+          {
+            "name": "status",
+            "description": "查看记录状态"
+          },
+          {
+            "name": "list",
+            "description": "列出已归档会话"
+          },
+          {
+            "name": "replay",
+            "description": "回溯指定会话内容(编号/标题关键词/ID)"
+          }
+        ]
+      }
+    ],
+    "configuration": {
+      "title": "Ctx Archive",
+      "properties": {
+        "ctxArchive.outputDir": {
+          "type": "string",
+          "default": "E:\\Code\\Agent\\ctx-archive",
+          "description": "归档输出目录(append-only JSONL 按会话分文件)"
+        },
+        "ctxArchive.recordingEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用自动记录"
+        },
+        "ctxArchive.pollIntervalMs": {
+          "type": "number",
+          "default": 5000,
+          "description": "轮询 chatSessions 目录的间隔(毫秒)"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.9.2",
+    "typescript": "^5.4.5"
+  }
+}
