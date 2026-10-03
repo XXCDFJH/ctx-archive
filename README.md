@@ -2,6 +2,7 @@
 
 把 VS Code Copilot Chat(内置 agent)的**聊天记录 + agent 操作**(工具调用、文件编辑)以
 append-only 方式归档,设计对齐 DeepSeek Harness 的会话持久化机制(事件溯源 + 只追加日志)。
+作为VSCode插件运行
 
 ## 工作原理
 
