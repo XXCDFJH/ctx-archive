@@ -2,11 +2,15 @@
   "name": "ctx-archive",
   "displayName": "Ctx Archive - append-only 上下文记录器",
   "description": "以 append-only 方式归档 VS Code Copilot Chat 会话(聊天记录 + agent 操作),灵感来自 DeepSeek Harness 的会话持久化机制",
-  "version": "1.0.0-alpha",
-  "publisher": "local",
+  "version": "1.0.0",
+  "publisher": "xxcdfjh",
   "license": "UNLICENSED",
   "engines": {
     "vscode": "^1.96.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/XXCDFJH/ctx-archive"
   },
   "categories": [
     "Other"
@@ -102,7 +106,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "verify:webview": "node scripts/verify-webview.cjs"
   },
   "devDependencies": {
     "@types/node": "^18.19.0",

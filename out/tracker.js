@@ -40,7 +40,10 @@ exports.Tracker = void 0;
  *
  * 策略:
  * - 源文件本身是 append-only OT 日志;跟踪器记住 (path -> byteOffset),
- *   只处理新增字节(天然幂等,崩溃/重启后从 offset 续)
+ *   只处理新增字节;
+ * - OT 日志是有状态的,进程重启后必须从 0 全量重放才能重建出正确状态;
+ *   重复追加交给归档层的来源指纹(src)拦截:同一行内容无论处理几次都只有一个指纹
+ * - 指纹用内容哈希而非字节偏移:日志被 VS Code 压缩重写后位置会变,内容不会
  * - 文件变小视为被 VS Code 重写,重置重放状态
  * - 最后一行不完整时留在残行缓冲,等下次补齐(撕裂尾行语义)
  */
@@ -56,6 +59,8 @@ class Tracker {
     watchers = [];
     watchedDirs = new Set();
     enabled = true;
+    /** sid:内容哈希 -> 该内容在本会话第几次出现(指纹的序号部分) */
+    lineCounters = new Map();
     log = vscode.window.createOutputChannel('Ctx Archive');
     constructor(archive) {
         this.archive = archive;
@@ -171,10 +176,16 @@ class Tracker {
         }
         st.lastMtimeMs = stat.mtimeMs;
         if (stat.size < st.offset) {
-            // 文件被重写:重置
+            // 文件被重写:重置重放状态与指纹计数(否则同一行的指纹会变,去重失效)
             st.offset = 0;
             st.carry = '';
             st.replayer = new otlog_1.OtReplayer(st.path);
+            const prefix = st.sid + ':';
+            for (const key of [...this.lineCounters.keys()]) {
+                if (key.startsWith(prefix)) {
+                    this.lineCounters.delete(key);
+                }
+            }
         }
         if (stat.size <= st.offset) {
             return;
@@ -207,10 +218,16 @@ class Tracker {
             if (!lineTrimmed) {
                 continue;
             }
-            const events = st.replayer.process(lineTrimmed, now);
+            // 来源指纹:会话 + 行内容哈希 + 同内容出现序号 → 重启重放/日志重写都不会重复
+            const lineKey = (0, otlog_1.lineFingerprintKey)(st.sid, lineTrimmed, this.lineCounters);
+            const events = st.replayer.process(lineTrimmed, now, lineKey);
             if (events.length > 0 && this.enabled) {
                 const meta = st.replayer.sessionMeta ?? undefined;
-                this.archive.append(st.sid, events, meta, now).catch((e) => {
+                this.archive.append(st.sid, events, meta, now).then((skipped) => {
+                    if (skipped > 0) {
+                        this.log.appendLine(`dedup ${st.sid}: skipped ${skipped} already-archived event(s)`);
+                    }
+                }).catch((e) => {
                     this.log.appendLine(`archive append failed for ${st.sid}: ${String(e)}`);
                 });
             }

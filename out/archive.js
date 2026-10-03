@@ -50,13 +50,17 @@ class Archive {
     nextSeq = new Map();
     /** sid -> 文件是否已创建 */
     initialized = new Set();
+    /** sid -> 已写入的最后已知时间(供缺失时间的事件回退) */
+    lastTime = new Map();
+    /** sid -> 已归档的来源指纹(同一源日志行不重复追加) */
+    srcs = new Map();
     constructor(root) {
         this.root = root;
     }
-    /** 追加事件到指定会话(异步,内部串行) */
+    /** 追加事件到指定会话(异步,内部串行);返回本次因指纹重复而跳过的事件数 */
     append(sid, events, meta, now) {
         if (events.length === 0) {
-            return Promise.resolve();
+            return Promise.resolve(0);
         }
         const time = now ?? Date.now();
         const prev = this.queues.get(sid) ?? Promise.resolve();
@@ -69,6 +73,9 @@ class Archive {
         await fs.promises.mkdir(this.root, { recursive: true });
         const file = path.join(this.root, `${sid}.jsonl`);
         const lines = [];
+        const eventTimes = events
+            .map((ev) => ev.time)
+            .filter((t) => typeof t === 'number' && t > 0);
         if (!this.initialized.has(sid)) {
             // 若文件已存在(上次会话的归档),则不重写 header,而是接续 seq
             let exists = false;
@@ -84,7 +91,8 @@ class Archive {
                     v: 1,
                     type: 'header',
                     seq: 0,
-                    time,
+                    // 取本批最早事件时间:比"插件第一次看到它的时刻"更接近真实会话起点
+                    time: eventTimes.length > 0 ? Math.min.apply(null, eventTimes) : time,
                     sid,
                     title: meta?.title,
                     model: meta?.model,
@@ -92,22 +100,54 @@ class Archive {
                 };
                 lines.push(JSON.stringify(header));
                 this.nextSeq.set(sid, 1);
+                this.srcs.set(sid, new Set());
             }
             else {
-                // 接续:读已有文件的最大 seq + 1
+                // 接续:读已有文件的最大 seq + 1,并接住最后已知时间与已归档指纹
                 const existing = await Archive.readArchive(file);
                 const maxSeq = existing.events.reduce((m, e) => Math.max(m, e.seq), 0);
                 this.nextSeq.set(sid, maxSeq + 1);
+                let last = existing.header?.time ?? 0;
+                const known = new Set();
+                for (const e of existing.events) {
+                    if (typeof e.time === 'number' && e.time > last) {
+                        last = e.time;
+                    }
+                    if (typeof e.src === 'string' && e.src !== '') {
+                        known.add(e.src);
+                    }
+                }
+                this.lastTime.set(sid, last);
+                this.srcs.set(sid, known);
             }
             this.initialized.add(sid);
         }
         let seq = this.nextSeq.get(sid) ?? 1;
+        let lastKnown = this.lastTime.get(sid) ?? (eventTimes.length > 0 ? Math.min.apply(null, eventTimes) : time);
+        const known = this.srcs.get(sid) ?? new Set();
+        let skipped = 0;
         for (const ev of events) {
+            const src = ev.src;
+            if (typeof src === 'string' && src !== '') {
+                if (known.has(src)) {
+                    skipped += 1; // 同一条源日志行已经归档过(重启重放 / 日志重写)
+                    continue;
+                }
+                known.add(src);
+            }
             const evTime = ev.time;
-            lines.push(JSON.stringify({ v: 1, ...ev, seq, time: evTime ?? time }));
+            const hasTime = typeof evTime === 'number' && evTime > 0;
+            // 缺时间的事件沿用最近已知时间:写 header 时间或处理时刻都会产生假时间
+            const stamp = hasTime ? evTime : lastKnown;
+            if (stamp > lastKnown) {
+                lastKnown = stamp;
+            }
+            lines.push(JSON.stringify({ v: 1, ...ev, seq, time: stamp }));
             seq += 1;
         }
         this.nextSeq.set(sid, seq);
+        this.lastTime.set(sid, lastKnown);
+        this.srcs.set(sid, known);
         // 只追加 + fsync
         const handle = await fs.promises.open(file, 'a');
         try {
@@ -117,12 +157,25 @@ class Archive {
         finally {
             await handle.close();
         }
+        return skipped;
     }
     /** 重建归档后调用:清空 seq/初始化缓存,后续追加重新从文件读取接续点 */
     reset() {
         this.queues.clear();
         this.nextSeq.clear();
         this.initialized.clear();
+        this.lastTime.clear();
+        this.srcs.clear();
+    }
+    /** 归档文件当前字节数(0 表示尚未归档) */
+    async archiveSize(sid) {
+        try {
+            const stat = await fs.promises.stat(path.join(this.root, `${sid}.jsonl`));
+            return stat.size;
+        }
+        catch {
+            return 0;
+        }
     }
     /** 读取归档:校验连续 seq、跳过撕裂尾行;返回已提交前缀 */
     static async readArchive(file) {
@@ -178,10 +231,18 @@ class Archive {
             const displayTitle = r.header?.title ||
                 (firstUser?.text ? firstUser.text.replace(/\s+/g, ' ').slice(0, 40) : '') ||
                 name.replace(/\.jsonl$/, '').slice(0, 8);
-            const displayTime = r.header ? new Date(r.header.time).toLocaleString() : '?';
-            out.push({ file, header: r.header, count: r.events.length, displayTitle, displayTime });
+            // 显示与排序都用"最后活动时间":header 是文件创建时刻,对跨天长会话会严重失真
+            const startTime = r.header?.time ?? 0;
+            let lastTime = startTime;
+            for (const e of r.events) {
+                if (typeof e.time === 'number' && e.time > lastTime) {
+                    lastTime = e.time;
+                }
+            }
+            const displayTime = lastTime > 0 ? new Date(lastTime).toLocaleString() : '?';
+            out.push({ file, header: r.header, count: r.events.length, displayTitle, displayTime, startTime, lastTime });
         }
-        out.sort((a, b) => (b.header?.time ?? 0) - (a.header?.time ?? 0));
+        out.sort((a, b) => b.lastTime - a.lastTime);
         return out;
     }
 }

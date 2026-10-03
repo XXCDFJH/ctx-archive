@@ -48,7 +48,38 @@ export type ArchiveEvent = (
 ) & {
   /** 事件原始时间戳(重建归档时保留);缺省时由归档层取追加时刻 */
   time?: number;
+  /**
+   * 来源指纹(sid:字节偏移:行内序号)。
+   * 同一条源日志行无论被处理几次(重启重放、日志重写),指纹都不变,
+   * 归档层据此去重,避免重复追加同一内容。
+   */
+  src?: string;
 };
+
+/** 32 位 FNV-1a 内容哈希(十六进制) */
+export function hash32(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16);
+}
+
+/**
+ * 生成稳定的行指纹键:sid + 行内容哈希 + 同内容出现序号。
+ * 与字节偏移无关 —— 日志被压缩重写后位置会变,内容不会。
+ * @param sid - 会话 id。
+ * @param line - 已 trim 的单行日志文本。
+ * @param seen - sid:哈希 -> 已出现次数 的计数器(同一会话内复用)。
+ * @returns 作为事件 src 前缀的指纹键。
+ */
+export function lineFingerprintKey(sid: string, line: string, seen: Map<string, number>): string {
+  const base = sid + ':' + hash32(line);
+  const count = seen.get(base) ?? 0;
+  seen.set(base, count + 1);
+  return base + ':' + count;
+}
 
 /** 会话元数据(来自初始快照与后续 patch) */
 export interface SessionMeta {
@@ -120,6 +151,23 @@ function cleanMarkdownRefs(s: string): string {
   });
 }
 
+/** 从单个响应条目里取出真实时间(直接字段 / 12 位以上 id 即毫秒时间戳) */
+function itemTimestamp(item: JsonObject): number | undefined {
+  const direct = item.timestamp;
+  if (typeof direct === 'number' && direct > 0) {
+    return direct;
+  }
+  const responseTs = item.responseTimestamp;
+  if (typeof responseTs === 'number' && responseTs > 0) {
+    return responseTs;
+  }
+  const id = item.id;
+  if (typeof id === 'string' && /^\d{12,}$/.test(id)) {
+    return Number(id);
+  }
+  return undefined;
+}
+
 /** 判定工具条目是否"已完成"且携带结果信息;若有则返回结果事件字段,否则返回 null */
 function extractToolResult(item: JsonObject): {
   text: string;
@@ -189,6 +237,8 @@ function extractToolResult(item: JsonObject): {
 export class OtReplayer {
   private state: JsonObject | null = null;
   private meta: SessionMeta | null = null;
+  /** request 下标 -> 已解析出的请求时间(仅缓存成功值) */
+  private requestTimeCache = new Map<number, number>();
   /** request 下标 -> 已归档的 response 条目数(快照只增,按条数去重) */
   private processed = new Map<number, number>();
   /** 已发出 user 事件的 request 下标 */
@@ -200,11 +250,67 @@ export class OtReplayer {
 
   constructor(private readonly sourcePath: string) {}
 
-  /** 从重建状态中读取指定请求的原始时间戳 */
+  /**
+   * 从重建状态中解析指定请求的真实时间。
+   * VS Code 只为早期请求写 requests[N].timestamp;后续请求要依次回退到
+   * responseTimestamp → 响应条目自身时间 → 工具轮次时间,否则时间会缺失。
+   * 只在成功解析时缓存:状态随日志推进继续补全,缺值不能锁死。
+   */
   private requestTimestamp(idx: number): number | undefined {
+    const cached = this.requestTimeCache.get(idx);
+    if (cached !== undefined) {
+      return cached;
+    }
     const requests = this.state?.requests as unknown[] | undefined;
     const req = requests?.[idx] as JsonObject | undefined;
-    return typeof req?.timestamp === 'number' ? (req.timestamp as number) : undefined;
+    if (!req) {
+      return undefined;
+    }
+    const candidates: number[] = [];
+    if (typeof req.timestamp === 'number' && req.timestamp > 0) {
+      candidates.push(req.timestamp);
+    }
+    if (typeof req.responseTimestamp === 'number' && req.responseTimestamp > 0) {
+      candidates.push(req.responseTimestamp);
+    }
+    const response = req.response as unknown[] | undefined;
+    if (Array.isArray(response)) {
+      for (const item of response) {
+        if (item && typeof item === 'object') {
+          const t = itemTimestamp(item as JsonObject);
+          if (t !== undefined) {
+            candidates.push(t);
+          }
+        }
+      }
+    }
+    for (const t of this.roundTimes(idx)) {
+      if (t !== undefined) {
+        candidates.push(t);
+      }
+    }
+    if (candidates.length === 0) {
+      return undefined;
+    }
+    const resolved = candidates.reduce((m, t) => (t < m ? t : m), candidates[0]);
+    this.requestTimeCache.set(idx, resolved);
+    return resolved;
+  }
+
+  /** result.metadata.toolCallRounds 的逐个时间戳(与工具调用顺序对应,可能含 undefined) */
+  private roundTimes(idx: number): (number | undefined)[] {
+    const requests = this.state?.requests as unknown[] | undefined;
+    const req = requests?.[idx] as JsonObject | undefined;
+    const metadata = (req?.result as JsonObject | undefined)?.metadata as JsonObject | undefined;
+    const rounds = metadata?.toolCallRounds;
+    const out: (number | undefined)[] = [];
+    if (Array.isArray(rounds)) {
+      for (const round of rounds) {
+        const raw = round && typeof round === 'object' ? (round as JsonObject).timestamp : undefined;
+        out.push(typeof raw === 'number' && raw > 0 ? raw : undefined);
+      }
+    }
+    return out;
   }
 
   /** 请求完成后读取重建状态的最终 token 用量,每个请求仅发出一次 */
@@ -239,7 +345,17 @@ export class OtReplayer {
   }
 
   /** 处理一行日志,返回此行新产生的归档事件 */
-  process(line: string, now: number): ArchiveEvent[] {
+  process(line: string, now: number, lineKey?: string): ArchiveEvent[] {
+    const events = this.processLine(line, now);
+    if (lineKey !== undefined) {
+      for (let i = 0; i < events.length; i += 1) {
+        events[i].src = lineKey + ':' + i;
+      }
+    }
+    return events;
+  }
+
+  private processLine(line: string, now: number): ArchiveEvent[] {
     let obj: JsonObject;
     try {
       obj = JSON.parse(line) as JsonObject;
@@ -274,7 +390,39 @@ export class OtReplayer {
       model: typeof selectedModel?.identifier === 'string' ? (selectedModel.identifier as string) : undefined,
       workspace: this.sourcePath,
     };
-    return [];
+    // 初始快照里已经存在的历史轮次不会再收到增量补丁,必须在这里补发,
+    // 否则日志被 VS Code 压缩重建后,早期对话会整段缺内容
+    return this.emitExistingRequests();
+  }
+
+  /** 补发初始状态中已存在轮次的事件(用户消息 + 响应条目 + 用量) */
+  private emitExistingRequests(): ArchiveEvent[] {
+    const requests = this.state?.requests as unknown[] | undefined;
+    if (!Array.isArray(requests)) {
+      return [];
+    }
+    const events: ArchiveEvent[] = [];
+    for (let idx = 0; idx < requests.length; idx += 1) {
+      const req = requests[idx] as JsonObject | undefined;
+      if (!req || typeof req !== 'object') {
+        continue;
+      }
+      if (!this.userEmitted.has(idx)) {
+        const result = req.result as JsonObject | undefined;
+        const rendered = (result?.metadata as JsonObject | undefined)?.renderedUserMessage;
+        const text = concatRenderedMessage(rendered).trim();
+        if (text) {
+          this.userEmitted.add(idx);
+          events.push({ type: 'user', request: idx, text, time: this.requestTimestamp(idx) });
+        }
+      }
+      const items = req.response as unknown[] | undefined;
+      if (Array.isArray(items) && items.length > 0) {
+        events.push(...this.emitResponseItems(idx, items as JsonObject[], 0));
+      }
+      this.emitUsage(idx, events);
+    }
+    return events;
   }
 
   private applyPatch(obj: JsonObject, now: number): ArchiveEvent[] {
@@ -324,8 +472,26 @@ export class OtReplayer {
     }
     const idx = k[1] as number;
     const items = obj.v as JsonObject[];
-    const start = this.processed.get(idx) ?? 0;
+    return this.emitResponseItems(idx, items, this.processed.get(idx) ?? 0);
+  }
+
+  /** 从一轮的响应条目列表发射事件(增量 start 起算;含工具结果的全量扫描去重) */
+  private emitResponseItems(idx: number, items: JsonObject[], start: number): ArchiveEvent[] {
     const reqTime = this.requestTimestamp(idx);
+    // 工具调用优先用各自轮次的时间戳:比"整轮共用请求时间"更接近真实
+    const roundTimes = this.roundTimes(idx);
+    const toolTimeByIndex = new Map<number, number>();
+    let toolCursor = 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item && typeof item === 'object' && item.kind === 'toolInvocationSerialized') {
+        const own = itemTimestamp(item) ?? roundTimes[toolCursor];
+        if (own !== undefined) {
+          toolTimeByIndex.set(i, own);
+        }
+        toolCursor += 1;
+      }
+    }
     const events: ArchiveEvent[] = [];
     // 兜底:若用户消息已由 kind=1 发出但 usage 尚未发出(快照型会话),在此补发
     if (this.userEmitted.has(idx)) {
@@ -349,16 +515,16 @@ export class OtReplayer {
         }
         const toolId = typeof item.toolId === 'string' ? (item.toolId as string) : undefined;
         const command = extractCommandLine(item);
-        events.push({ type: 'tool', request: idx, text: cleanMarkdownRefs(text), toolId, command, time: reqTime });
+        events.push({ type: 'tool', request: idx, text: cleanMarkdownRefs(text), toolId, command, time: toolTimeByIndex.get(i) ?? reqTime });
       } else if (kind === 'textEditGroup') {
-        events.push({ type: 'edit', request: idx, text: extractText(item), time: reqTime });
+        events.push({ type: 'edit', request: idx, text: extractText(item), time: itemTimestamp(item) ?? reqTime });
       } else if (kind === 'thinking') {
         // 思考条目的 id 通常是毫秒时间戳字符串,用其作为事件时间
         const thinkTs = typeof item.id === 'string' && /^\d{12,}$/.test(item.id) ? Number(item.id) : undefined;
-        events.push({ type: 'thinking', request: idx, text: extractText(item), time: thinkTs ?? reqTime });
+        events.push({ type: 'thinking', request: idx, text: extractText(item), time: itemTimestamp(item) ?? thinkTs ?? reqTime });
       } else {
         // 纯文本 / 其他未知条目:视为助手文本
-        events.push({ type: 'assistant', request: idx, text: extractText(item), time: reqTime });
+        events.push({ type: 'assistant', request: idx, text: extractText(item), time: itemTimestamp(item) ?? reqTime });
       }
     }
     this.processed.set(idx, items.length);
@@ -381,7 +547,12 @@ export class OtReplayer {
       }
       this.resultEmitted.add(dedupKey);
       const { timestamp, ...rest } = result;
-      events.push({ type: 'toolResult', request: idx, ...rest, time: timestamp ?? this.requestTimestamp(idx) });
+      events.push({
+        type: 'toolResult',
+        request: idx,
+        ...rest,
+        time: timestamp ?? itemTimestamp(item) ?? toolTimeByIndex.get(i) ?? this.requestTimestamp(idx),
+      });
     }
     return events;
   }

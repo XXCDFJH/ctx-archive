@@ -12,14 +12,20 @@ import * as vscode from 'vscode';
 import { Archive } from './archive';
 import { Tracker } from './tracker';
 
-const MAX_EVENTS = 2000;
+const MAX_EVENTS = 5000;
 const TRUNCATE_LEN = 5000;
+/** postMessage 体积预算:超出时只发最近的部分(截断时保留最新内容) */
+const MAX_PAYLOAD_BYTES = 6 * 1024 * 1024;
 
 interface SessionSummary {
   file: string;
   sid: string;
   title: string;
   time: string;
+  /** 最后活动时间(与 time 同源,供列表按时间排序) */
+  timeMs: number;
+  /** 会话起始时间,用于悬停提示 */
+  startTime: number;
   count: number;
   model: string;
 }
@@ -160,6 +166,8 @@ export class ArchivePanel {
       sid: item.header?.sid ?? path.basename(item.file).replace(/\.jsonl$/, ''),
       title: item.displayTitle,
       time: item.displayTime,
+      timeMs: item.lastTime,
+      startTime: item.startTime,
       count: item.count,
       model: item.header?.model ?? '',
     }));
@@ -169,7 +177,22 @@ export class ArchivePanel {
 
   private async sendSessionData(file: string): Promise<void> {
     const r = await Archive.readArchive(file);
-    const events: EventPayload[] = r.events.slice(0, MAX_EVENTS).map((e) => ({
+    // 长会话只发最近的一段:截断时保留最新内容(早期内容已被更近的上下文取代),
+    // 并用字节预算兜住消息体积
+    const selected: typeof r.events = [];
+    let bytes = 0;
+    for (let i = r.events.length - 1; i >= 0 && selected.length < MAX_EVENTS; i -= 1) {
+      const e = r.events[i];
+      const cost = (e.text !== undefined ? e.text.length : 0)
+        + (e.command !== undefined ? e.command.length : 0) + 256;
+      if (bytes + cost > MAX_PAYLOAD_BYTES && selected.length > 0) {
+        break;
+      }
+      bytes += cost;
+      selected.push(e);
+    }
+    selected.reverse();
+    const events: EventPayload[] = selected.map((e) => ({
       type: e.type,
       seq: e.seq,
       time: e.time,
@@ -192,6 +215,7 @@ export class ArchivePanel {
       time: r.header ? new Date(r.header.time).toLocaleString() : '?',
       source: r.header?.source ?? '',
       total: r.events.length,
+      truncated: selected.length < r.events.length,
       events,
     });
   }
@@ -237,10 +261,19 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
   width: 260px; flex: 0 0 auto; overflow-y: auto; border-right: 1px solid var(--border);
   background: var(--vscode-sideBar-background);
 }
+#list-tools { display: flex; align-items: center; gap: 6px; padding: 8px; }
 #search {
-  margin: 8px; width: calc(100% - 16px); padding: 5px 8px; color: var(--vscode-input-foreground);
+  flex: 1; min-width: 0; padding: 5px 8px; color: var(--vscode-input-foreground);
   background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 4px;
 }
+/* 排序小按钮(聊天列表 / 对话块共用) */
+.mini {
+  padding: 1px 8px; font-size: 10.5px; border-radius: 10px; white-space: nowrap;
+  background: transparent; border: 1px solid var(--border); color: var(--vscode-foreground);
+  cursor: pointer; opacity: .85; flex: 0 0 auto;
+}
+.mini:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.2)); opacity: 1; }
+.mini:focus-visible { outline: 1px solid var(--vscode-focusBorder, #3794ff); outline-offset: 1px; }
 .session {
   padding: 8px 12px; cursor: pointer; border-bottom: 1px solid transparent;
 }
@@ -249,7 +282,8 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
 .session .t { font-size: 12.5px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session .m { font-size: 11px; opacity: .75; margin-top: 2px; }
 #feed { flex: 1; overflow-y: auto; padding: 12px 16px 24px; }
-#feed-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+#feed-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+#feed-title { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; }
 #feed-meta { font-size: 11px; opacity: .7; margin-bottom: 6px; }
 #feed-stats {
   font-size: 11px; opacity: .85; margin-bottom: 12px; padding: 6px 10px;
@@ -257,22 +291,99 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
   display: flex; flex-wrap: wrap; gap: 4px 14px;
 }
 #feed-stats b { font-weight: 600; }
-/* ---- 时间总轴(泳道图) ---- */
-#gantt {
-  margin-bottom: 10px; padding: 6px 8px;
-  border: 1px solid var(--border); border-radius: 8px;
-  background: var(--card-bg);
+/* ---- 时间总轴(固定总览轴,套用 DSH TrajectoryTimeline 方案) ---- */
+#right { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+#timeline {
+  flex: 0 0 auto; position: relative; user-select: none;
+  border-bottom: 1px solid var(--border);
+  background: var(--vscode-editorWidget-background, rgba(128,128,128,.06));
 }
-#gantt .g-title { font-size: 10.5px; opacity: .75; margin-bottom: 4px; }
-.g-row { display: flex; align-items: center; margin-bottom: 2px; }
-.g-label { flex: 0 0 36px; font-size: 10.5px; opacity: .85; text-align: right; padding-right: 8px; white-space: nowrap; align-self: flex-start; padding-top: 3px; }
-.g-track { position: relative; flex: 1; height: 14px; background: rgba(0,0,0,.10); border-radius: 4px; overflow: hidden; }
-.g-block { position: absolute; border-radius: 2px; cursor: pointer; opacity: .85; min-width: 2px; }
-.g-block:hover { opacity: 1; }
-.g-block.sel { opacity: 1; outline: 1.5px solid #3794ff; outline-offset: 1px; z-index: 2; }
-.g-playhead {
-  position: absolute; top: -2px; bottom: -2px; width: 2px; background: #e6d23c;
-  display: none; pointer-events: none; z-index: 3;
+.tl-bar {
+  display: flex; align-items: center; gap: 10px; padding: 4px 8px; font-size: 11px;
+  border-bottom: 1px solid var(--border);
+}
+.tl-bar .tl-name { font-weight: 600; opacity: .9; }
+.tl-bar .spacer { flex: 1; }
+.tl-bar .tl-chip {
+  padding: 1px 8px; border-radius: 9px; cursor: pointer;
+  border: 1px solid var(--vscode-textLink-foreground, #3794ff);
+  color: var(--vscode-textLink-foreground, #3794ff); white-space: nowrap;
+}
+.tl-bar .tl-hint { opacity: .55; font-size: 10.5px; white-space: nowrap; }
+/* 模式按钮:四种投影收进一个可循环点击的按钮 */
+.tl-mode-cycle {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
+  background: transparent; border: 1px solid var(--border); border-radius: 10px;
+  color: inherit; font: inherit; cursor: pointer; opacity: .9; white-space: nowrap;
+}
+.tl-mode-cycle:hover { background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,.2)); opacity: 1; }
+.tl-mode-cycle:focus-visible { outline: 1px solid var(--vscode-focusBorder, #3794ff); outline-offset: 1px; }
+.tl-mode-cycle .tl-mode-key { opacity: .5; font-size: 10px; }
+.tl-mode-cycle .tl-mode-label { font-weight: 600; }
+.tl-plot { display: grid; grid-template-columns: 44px minmax(0, 1fr); height: 50px; overflow: hidden; }
+.tl-labels { position: relative; border-right: 1px solid var(--border); font-size: 10px; opacity: .8; }
+.tl-labels span { position: absolute; right: 4px; height: 8px; line-height: 8px; }
+.tl-labels span:nth-child(1) { top: 7px; }
+.tl-labels span:nth-child(2) { top: 21px; }
+.tl-labels span:nth-child(3) { top: 35px; }
+.tl-track { position: relative; overflow: hidden; cursor: crosshair; touch-action: none; }
+.tl-track:focus-visible { outline: 1px solid var(--vscode-focusBorder, #3794ff); outline-offset: -1px; }
+.tl-track[data-panning='true'] { cursor: grabbing; }
+/* 域容器:按缩放窗口拉伸,子元素一律用全域百分比定位 */
+.tl-projected { position: absolute; top: 0; bottom: 0; left: var(--tl-domain-left); width: var(--tl-domain-width); }
+.tl-turns, .tl-domain { position: absolute; top: 0; bottom: 0; left: 0; right: 0; }
+.tl-turn { position: absolute; top: 0; bottom: 0; left: var(--tl-turn-left); width: .5px; background: var(--border); z-index: 3; }
+.tl-span {
+  position: absolute; top: calc(7px + var(--tl-span-lane) * 14px);
+  left: calc(var(--tl-span-left) + var(--tl-span-gap));
+  width: max(2px, calc(var(--tl-span-width) - var(--tl-span-gap) * 2));
+  height: 8px; min-width: 2px; border-radius: 1px; background: #8a8a8a; opacity: .8; z-index: 2;
+}
+.tl-span[data-equal='true'] { width: 8px; min-width: 8px; }
+.tl-span[data-kind='user'] { background: #4fc1ff; }
+.tl-span[data-kind='assistant'] { background: #c586c0; }
+.tl-span[data-kind='thinking'] { background: #8a8a8a; }
+.tl-span[data-kind='tool'] { background: #e6b800; }
+.tl-span[data-kind='toolResult'] { background: #4caf50; }
+.tl-span[data-kind='edit'] { background: #d16969; }
+.tl-span[data-kind='note'] { background: #e6d23c; }
+.tl-span[data-error='true'] { background: #f14c4c; }
+.tl-span[data-dim='true'] { opacity: .16; }
+.tl-span[data-current='true'] {
+  opacity: 1; z-index: 5;
+  box-shadow: 0 0 0 1px var(--vscode-editor-background), 0 0 0 2px #3794ff;
+}
+.tl-sel {
+  position: absolute; z-index: 1; top: 0; bottom: 0; min-width: 1px;
+  left: var(--tl-sel-left); width: var(--tl-sel-width);
+  background: rgba(55,148,255,.14); pointer-events: none;
+}
+.tl-sel-edges {
+  position: absolute; z-index: 4; top: 0; bottom: 0; min-width: 1px;
+  left: var(--tl-sel-left); width: var(--tl-sel-width); pointer-events: none;
+}
+.tl-sel-edges::before, .tl-sel-edges::after {
+  content: ''; position: absolute; top: 0; bottom: 0; width: 1px; background: #3794ff;
+}
+.tl-sel-edges::before { left: 0; }
+.tl-sel-edges::after { right: 0; }
+.tl-hline {
+  position: absolute; z-index: 4; top: 0; bottom: 0; left: var(--tl-hover-left);
+  width: 1px; background: var(--vscode-foreground); opacity: .35; pointer-events: none;
+}
+.tl-empty { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 11px; opacity: .55; }
+.tl-tip {
+  position: fixed; z-index: 50; display: none; max-width: 340px; padding: 6px 9px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--vscode-editorHoverWidget-background, #252526);
+  color: var(--vscode-editorHoverWidget-foreground, #cccccc);
+  font-size: 11px; line-height: 1.55; white-space: pre-line; pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0,0,0,.35);
+}
+.tl-node.dimmed { opacity: .2; }
+.tl-node.focused .summary-row {
+  border-color: var(--vscode-textLink-foreground, #3794ff);
+  background: var(--vscode-list-hoverBackground);
 }
 /* ---- 时间轴 ---- */
 .tl { position: relative; }
@@ -324,6 +435,14 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
 .summary-row:hover { background: var(--vscode-list-hoverBackground); border-color: var(--border); }
 .summary-row .s-icon { margin-right: 6px; }
 .summary-row .s-type { opacity: .65; font-size: 11px; margin-right: 6px; }
+/* 行内结果(借鉴 DSH:同一条记录直接展示 "调用 → 结果") */
+.summary-row .s-arrow { opacity: .45; margin: 0 6px; }
+.summary-row .s-result { opacity: .72; }
+.summary-row .s-result.err { color: #f14c4c; opacity: .9; }
+/* 折叠摘要行(整轮折叠后的合成行) */
+.summary-row.folded { opacity: .72; font-style: italic; }
+.tl-node.n-folded .dot { background: transparent; border-color: var(--border); }
+.tl-node.n-folded .badge.b-folded { border-style: dashed; opacity: .7; }
 .detail {
   margin-top: 6px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--vscode-editorWidget-background, rgba(128,128,128,.06));
@@ -415,15 +534,24 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
 </header>
 <div class="main">
   <div id="list">
-    <input id="search" type="text" placeholder="搜索标题 / ID...">
+    <div id="list-tools">
+      <input id="search" type="text" placeholder="搜索标题 / ID...">
+      <button id="btn-list-order" class="mini" title="聊天按时间排序"></button>
+    </div>
     <div id="list-body"><div class="empty">加载中…</div></div>
   </div>
+  <div id="right">
+  <div id="timeline"></div>
   <div id="feed">
     <div id="feed-stats"></div>
-    <div id="gantt"></div>
-    <div id="feed-title"></div>
+    <div id="feed-head">
+      <div id="feed-title"></div>
+      <button id="btn-fold" class="mini" title="折叠 / 展开整轮对话" style="display:none"></button>
+      <button id="btn-feed-order" class="mini" title="对话块按时间排序" style="display:none"></button>
+    </div>
     <div id="feed-meta"></div>
     <div id="feed-body"><div class="empty">左侧选择一个会话开始回溯</div></div>
+  </div>
   </div>
 </div>
 <div id="composer">
@@ -437,10 +565,40 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
   let currentFile = null;
   let recording = true;
 
+  // 面板级偏好(排序、时间轴模式):统一存进一个持久化对象
+  let panelState = {};
+  try {
+    const restored = typeof vscode.getState === 'function' ? vscode.getState() : null;
+    if (restored !== null && typeof restored === 'object') panelState = restored;
+  } catch (e) {
+    panelState = {};
+  }
+  function saveState(patch) {
+    panelState = Object.assign({}, panelState, patch);
+    try {
+      if (typeof vscode.setState === 'function') vscode.setState(panelState);
+    } catch (e) {
+      // 持久化失败不影响渲染
+    }
+  }
+  /** 聊天列表顺序:desc=新→旧(默认),asc=旧→新 */
+  let listOrder = panelState.listOrder === 'asc' ? 'asc' : 'desc';
+  /** 对话块顺序:asc=旧→新(默认),desc=新→旧 */
+  let feedOrder = panelState.feedOrder === 'desc' ? 'desc' : 'asc';
+  /** 明细面板标签记忆(借鉴 DSH tabHistory) */
+  let detailTab = typeof panelState.detailTab === 'string' ? panelState.detailTab : 'overview';
+  /** 已折叠的轮次(按 request 编号,稳定键) */
+  const collapsedRequests = new Set();
+  /** 当前账本事件(供折叠/定位使用) */
+  let feedEvents = [];
+  /** 当前会话 id(切会话时重置折叠) */
+  let feedSessionId = null;
+
   const $ = (id) => document.getElementById(id);
   const dot = $('status-dot'), statusText = $('status-text'), toggleBtn = $('btn-toggle');
   const listBody = $('list-body'), feedTitle = $('feed-title'), feedMeta = $('feed-meta');
-  const feedStats = $('feed-stats'), gantt = $('gantt'), feedBody = $('feed-body');
+  const feedStats = $('feed-stats'), timelineRoot = $('timeline'), feedBody = $('feed-body');
+  const listOrderBtn = $('btn-list-order'), feedOrderBtn = $('btn-feed-order'), foldBtn = $('btn-fold');
 
   const BADGES = {
     user: ['输入', 'b-user'],
@@ -476,12 +634,21 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
   function renderList(filter) {
     listBody.textContent = '';
     const q = (filter || '').toLowerCase();
-    const items = sessions.filter(s => !q || s.title.toLowerCase().includes(q) || s.sid.toLowerCase().includes(q));
+    listOrderBtn.textContent = listOrder === 'asc' ? '时间 ↑' : '时间 ↓';
+    listOrderBtn.title = listOrder === 'asc'
+      ? '聊天按时间升序(旧 → 新),点击切换为降序'
+      : '聊天按时间降序(新 → 旧),点击切换为升序';
+    const items = sessions
+      .filter(s => !q || s.title.toLowerCase().includes(q) || s.sid.toLowerCase().includes(q))
+      .sort((a, b) => (listOrder === 'asc' ? a.timeMs - b.timeMs : b.timeMs - a.timeMs));
     if (items.length === 0) { listBody.appendChild(el('div', 'empty', '没有匹配的会话')); return; }
     for (const s of items) {
       const d = el('div', 'session' + (currentFile === s.file ? ' active' : ''));
       d.appendChild(el('div', 't', s.title));
-      d.appendChild(el('div', 'm', s.time + ' · ' + s.count + ' 事件' + (s.model ? ' · ' + s.model : '')));
+      const meta = el('div', 'm', '最近 ' + s.time + ' · ' + s.count + ' 事件' + (s.model ? ' · ' + s.model : ''));
+      meta.title = '最近活动:' + s.time
+        + '\\n开始于:' + (s.startTime > 0 ? new Date(s.startTime).toLocaleString('zh-CN') : '未知');
+      d.appendChild(meta);
       d.addEventListener('click', () => { currentFile = s.file; renderList(q); vscode.postMessage({ type: 'selectSession', file: s.file }); });
       listBody.appendChild(d);
     }
@@ -489,108 +656,599 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
 
   const TYPE_ICONS = { user: '👤', assistant: '🤖', tool: '🔧', toolResult: '✅', edit: '✏️', thinking: '💭', note: '📝', usage: '⚡' };
 
-  /** 泳道归属:0=输入,1=模型,2=工具 */
+  /** 泳道归属:0=输入(含手动注释),1=模型,2=工具 */
   function laneOf(ev) {
     if (ev.type === 'user' || ev.type === 'note') return 0;
     if (ev.type === 'assistant' || ev.type === 'thinking') return 1;
     return 2;
   }
 
-  /** 时间总轴:三泳道横向连续分段,每个事件一个色块,点击高亮并显示播放头 */
-  let lastGanttData = null;
-  function buildGantt(data) {
-    lastGanttData = data;
-    gantt.textContent = '';
-    const evs = data.events.filter((e) => e.type !== 'usage' && e.type !== 'note');
-    if (evs.length < 2) {
-      gantt.appendChild(el('div', 'g-title', '时间总轴:事件过少,暂不显示'));
-      return;
-    }
-    const t0 = evs.reduce((m, e) => Math.min(m, e.time), Infinity);
-    const t1 = evs.reduce((m, e) => Math.max(m, e.time), -Infinity);
-    const span = Math.max(1, t1 - t0);
-    const leftPct = (t) => ((t - t0) / span) * 100;
-    const names = ['输入', '模型', '工具'];
-    const typeColors = {
-      user: '#4fc1ff', assistant: '#c586c0', tool: '#e6b800',
-      toolResult: '#4caf50', edit: '#d16969', thinking: '#8a8a8a',
-    };
-    const typeNames = {
-      user: '输入', assistant: '助手', tool: '工具调用',
-      toolResult: '返回结果', edit: '文件编辑', thinking: '思考',
-    };
-    /** 块宽自适应:事件越多越窄,夹在 1.5% ~ 4% 之间 */
-    const blockWpct = (n) => Math.min(4, Math.max(1.5, (80 / Math.max(1, n)) * 0.8));
-    const playheads = [];
-    let selectedBlock = null;
-    const selectBlock = (block, e) => {
-      if (selectedBlock) {
-        selectedBlock.classList.remove('sel');
-      }
-      block.classList.add('sel');
-      selectedBlock = block;
-      const center = parseFloat(block.style.left) + parseFloat(block.style.width) / 2;
-      playheads.forEach((p) => {
-        p.style.left = center + '%';
-        p.style.display = 'block';
-      });
-      const anchor = feedBody.querySelector('#req-anchor-' + e.request);
-      if (anchor) {
-        anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }
-    };
-    gantt.appendChild(el('div', 'g-title', '时间总轴(点击色块定位轮次)'));
-    for (let li = 0; li < 3; li++) {
-      const lane = evs.filter((e) => laneOf(e) === li).sort((a, b) => a.time - b.time || a.seq - b.seq);
-      const byTime = new Map();
-      for (const e of lane) {
-        const list = byTime.get(e.time) || [];
-        list.push(e);
-        byTime.set(e.time, list);
-      }
-      const times = Array.from(byTime.keys()).sort((a, b) => a - b);
-      const row = el('div', 'g-row');
-      row.appendChild(el('div', 'g-label', names[li]));
-      const track = el('div', 'g-track');
-      const playhead = el('div', 'g-playhead');
-      track.appendChild(playhead);
-      playheads.push(playhead);
-      const bw = blockWpct(lane.length);
-      // 1) 同时刻事件先横向铺开(块宽递增),并钳制在轨道内
-      const items = [];
-      for (const t of times) {
-        const list = byTime.get(t);
-        list.forEach((e, j) => {
-          items.push({ e, left: Math.min(leftPct(t) + j * bw, 100 - bw), layer: 0 });
+  /* ---- 时间总轴(固定总览轴,套用 DSH TrajectoryTimeline 方案) ----
+   * 1) 轴的 DOM 一次构建,缩放/平移只改 CSS 变量,不重建节点
+   * 2) 域容器按缩放窗口拉伸,子元素一律用全域百分比定位 → 缩放零重排
+   * 3) 滚轮以鼠标为锚点缩放;左键拖动选区;右键拖动平移;拖到边缘自动平移
+   * 4) 选区联动账本:未命中的节点淡出
+   * 5) 两个开关组合出四种投影:顺序等宽 / 真实时间 / 真实耗时 / 空闲压缩
+   */
+  const TL_SHORT = {
+    user: '输入', assistant: '助手', tool: '工具调用',
+    toolResult: '返回结果', edit: '文件编辑', thinking: '思考', note: '注释',
+  };
+  const TL_MIN_DRAG_PX = 3;
+  /** 超过该间隔视为挂机,不计入活动时长 */
+  const TL_IDLE_GAP_MS = 30 * 60 * 1000;
+  const TL_EDGE_ZONE_FRACTION = 0.08;
+  const TL_EDGE_STEP_FRACTION = 0.025;
+  const TL_EDGE_MAX_PX = 32;
+  const TL_TIP_DELAY_MS = 400;
+
+  let tlEvents = [];
+  let tlModel = null;
+  /** 投影模式表:一个按钮按此顺序循环切换 */
+  const TL_MODES = [
+    { key: 'sequence', label: '顺序', duration: false, time: false, hint: '按事件顺序等宽排布(不含真实时间)' },
+    { key: 'time', label: '时间', duration: false, time: true, hint: '横坐标=真实时间戳,保留空闲间隙' },
+    { key: 'duration', label: '时长', duration: true, time: false, hint: '宽度=真实耗时,压缩空闲间隙' },
+    { key: 'actual', label: '实际', duration: true, time: true, hint: '完整真实轴:宽度=真实耗时且保留空闲' },
+  ];
+  let tlOpts = { duration: false, time: false };
+  // 记住上次选择的模式(读取失败时退回顺序模式)
+  for (const mode of TL_MODES) {
+    if (mode.key === panelState.tlMode) tlOpts = { duration: mode.duration, time: mode.time };
+  }
+  let tlViewport = null;
+  let tlRange = null;
+  let tlDraft = null;
+  let tlDrag = null;
+  let tlPan = null;
+  let tlTipTimer = null;
+  let tlTipIndex = null;
+  let tlSpanEls = new Map();
+  let tlIndexToNode = new Map();
+  let tlDom = null;
+  const tlTip = el('div', 'tl-tip');
+  document.body.appendChild(tlTip);
+
+  function tlDurationMs(ev) {
+    return typeof ev.durationMs === 'number' && isFinite(ev.durationMs) && ev.durationMs > 0 ? ev.durationMs : 0;
+  }
+
+  function fmtMs(ms) {
+    return ms < 1000 ? Math.round(ms) + ' ms' : fmtDuration(ms);
+  }
+
+  function fmtTimeMs(t) {
+    return new Date(t).toLocaleTimeString('zh-CN', { hour12: false, fractionalSecondDigits: 3 });
+  }
+
+  /** 两个开关 → 四种投影:顺序等宽 / 真实时间 / 真实耗时 / 空闲压缩 */
+  function deriveModel() {
+    const actualDuration = tlOpts.duration;
+    const actualTime = tlOpts.time;
+    const spans = [];
+    const turnBounds = [];
+    // 仅当两个开关都关闭才退回「按事件顺序等宽」;任一时间开关打开即按真实时间戳定位
+    if (!actualDuration && !actualTime) {
+      for (const ev of tlEvents) {
+        spans.push({
+          index: ev.__i, ev: ev, kind: ev.type, lane: laneOf(ev),
+          start: spans.length, end: spans.length + 1,
         });
       }
-      items.sort((a, b) => a.left - b.left || a.e.seq - b.e.seq);
-      // 2) 仍横向重叠的块用贪心分层纵向错开,保证 y 方向不重叠
-      const layerRight = [];
-      for (const it of items) {
-        let layer = 0;
-        while (layer < 30 && layerRight[layer] !== undefined && layerRight[layer] > it.left) {
-          layer++;
-        }
-        layerRight[layer] = it.left + bw;
-        it.layer = layer;
+      if (spans.length === 0) return null;
+      let seen = null;
+      for (const s of spans) {
+        if (s.ev.request !== seen) { seen = s.ev.request; turnBounds.push({ request: seen, time: s.start }); }
       }
-      const BH = 6; // 每层块高(px)
-      track.style.height = Math.max(14, layerRight.length * BH + 2) + 'px';
-      for (const it of items) {
-        const block = el('div', 'g-block');
-        block.style.left = it.left + '%';
-        block.style.width = bw + '%';
-        block.style.top = it.layer * BH + 1 + 'px';
-        block.style.height = BH - 1 + 'px';
-        block.style.background = typeColors[it.e.type] || '#8a8a8a';
-        block.title = (typeNames[it.e.type] || it.e.type) + ' · 请求 #' + it.e.request + ' · seq ' + it.e.seq + ' · ' + fmtTime(it.e.time);
-        block.addEventListener('click', () => selectBlock(block, it.e));
-        track.appendChild(block);
-      }
-      row.appendChild(track);
-      gantt.appendChild(row);
+      return { start: 0, end: spans.length, spans: spans, turnBounds: turnBounds };
     }
+    const raw = tlEvents.map((ev) => ({
+      index: ev.__i, ev: ev, kind: ev.type, lane: laneOf(ev),
+      start: ev.time, end: ev.time + tlDurationMs(ev),
+    }));
+    if (raw.length === 0) return null;
+    // 空闲压缩:排序扫描累计被折叠掉的空隙,投影时统一减掉
+    const compress = actualDuration && !actualTime;
+    const removedBySpan = new Map();
+    let removed = 0;
+    let coveredUntil = null;
+    for (const s of raw.slice().sort((a, b) => a.start - b.start || a.end - b.end)) {
+      if (compress && coveredUntil !== null && s.start > coveredUntil) removed += s.start - coveredUntil;
+      removedBySpan.set(s, removed);
+      coveredUntil = coveredUntil === null ? s.end : Math.max(coveredUntil, s.end);
+    }
+    const projected = raw.map((s) => {
+      const off = removedBySpan.get(s) || 0;
+      return {
+        index: s.index, ev: s.ev, kind: s.kind, lane: s.lane,
+        start: s.start - off,
+        end: (actualDuration ? s.end : s.start) - off,
+      };
+    });
+    const firstByRequest = new Map();
+    for (const s of projected) {
+      const prev = firstByRequest.get(s.ev.request);
+      if (prev === undefined || s.start < prev) firstByRequest.set(s.ev.request, s.start);
+    }
+    firstByRequest.forEach((t, request) => turnBounds.push({ request: request, time: t }));
+    turnBounds.sort((a, b) => a.time - b.time);
+    return {
+      start: Math.min.apply(null, projected.map((s) => s.start)),
+      end: Math.max.apply(null, projected.map((s) => s.end)),
+      spans: projected,
+      turnBounds: turnBounds,
+    };
+  }
+
+  /** 当前可见域(视窗为空表示全域) */
+  function tlDomain() {
+    const full = Math.max(1, tlModel.end - tlModel.start);
+    if (tlViewport === null) return { start: tlModel.start, duration: full, full: full };
+    const dur = Math.min(full, Math.max(1, tlViewport.end - tlViewport.start));
+    const start = Math.min(Math.max(tlViewport.start, tlModel.start), Math.max(tlModel.start, tlModel.end - dur));
+    return { start: start, duration: dur, full: full };
+  }
+
+  function tlUpdateProjection() {
+    if (tlDom === null || tlModel === null) return;
+    const d = tlDomain();
+    // 左偏移取负:容器被放大后向左移出,子元素的全域百分比才落回真实时间位置
+    tlDom.projected.style.setProperty('--tl-domain-left', (-(d.start - tlModel.start) / d.duration * 100).toFixed(4) + '%');
+    tlDom.projected.style.setProperty('--tl-domain-width', (d.full / d.duration * 100).toFixed(4) + '%');
+  }
+
+  function tlFocusIndexes() {
+    if (tlModel === null || tlRange === null) return null;
+    const set = new Set();
+    for (const s of tlModel.spans) {
+      if (s.start <= tlRange.end && s.end >= tlRange.start) set.add(s.index);
+    }
+    return set;
+  }
+
+  function tlFractionOfRange(range) {
+    const d = tlDomain();
+    const hi = Math.max(d.start, Math.min(d.start + d.duration, range.end));
+    const lo = Math.max(d.start, Math.min(d.start + d.duration, range.start));
+    return {
+      start: (Math.min(lo, hi) - d.start) / d.duration,
+      end: (Math.max(lo, hi) - d.start) / d.duration,
+    };
+  }
+
+  function tlUpdateSelection() {
+    if (tlDom === null || tlModel === null) return;
+    const frac = tlDraft !== null ? tlFractionOfRange(tlDraft)
+      : tlRange !== null ? tlFractionOfRange(tlRange) : null;
+    if (frac === null) {
+      tlDom.sel.style.display = 'none';
+      tlDom.edges.style.display = 'none';
+      return;
+    }
+    tlDom.sel.style.display = '';
+    tlDom.edges.style.display = '';
+    tlDom.sel.dataset.dragging = tlDraft !== null ? 'true' : 'false';
+    [tlDom.sel, tlDom.edges].forEach((node) => {
+      node.style.setProperty('--tl-sel-left', (frac.start * 100).toFixed(4) + '%');
+      node.style.setProperty('--tl-sel-width', ((frac.end - frac.start) * 100).toFixed(4) + '%');
+    });
+  }
+
+  function tlApplyLedgerFilter() {
+    const focus = tlFocusIndexes();
+    tlIndexToNode.forEach((node, index) => {
+      const on = focus === null || focus.has(index);
+      node.classList.toggle('dimmed', !on);
+      node.classList.toggle('focused', focus !== null && on);
+    });
+    tlSpanEls.forEach((spanEl, index) => {
+      if (focus === null || focus.has(index)) spanEl.removeAttribute('data-dim');
+      else spanEl.dataset.dim = 'true';
+    });
+    if (tlDom === null) return;
+    if (focus === null) {
+      tlDom.chip.style.display = 'none';
+      tlDom.chip.textContent = '';
+    } else {
+      tlDom.chip.style.display = '';
+      tlDom.chip.textContent = '已选 ' + focus.size + ' / ' + tlEvents.length + ' 事件';
+    }
+  }
+
+  function tlHideTip() {
+    if (tlTipTimer) { clearTimeout(tlTipTimer); tlTipTimer = null; }
+    tlTipIndex = null;
+    tlTip.style.display = 'none';
+  }
+
+  function tlTipText(span) {
+    const ev = span.ev;
+    const head = (TL_SHORT[ev.type] || ev.type)
+      + (ev.toolId ? ' · ' + ev.toolId : '')
+      + ' · 请求 #' + ev.request + ' · seq ' + ev.seq;
+    const d = tlDurationMs(ev);
+    const range = fmtTimeMs(ev.time) + (d > 0 ? ' → ' + fmtTimeMs(ev.time + d) : '');
+    const meta = [];
+    if (d > 0) meta.push('耗时 ' + fmtMs(d));
+    if (ev.exitCode !== undefined) meta.push('退出码 ' + ev.exitCode);
+    if (ev.promptTokens !== undefined || ev.completionTokens !== undefined) {
+      meta.push('tokens ' + fmtTok(ev.promptTokens) + ' + ' + fmtTok(ev.completionTokens));
+    }
+    return meta.length > 0 ? head + '\\n' + range + '\\n' + meta.join(' · ') : head + '\\n' + range;
+  }
+
+  function tlShowTip(span, clientX, clientY) {
+    tlTip.textContent = tlTipText(span);
+    tlTip.style.display = 'block';
+    const w = tlTip.offsetWidth, h = tlTip.offsetHeight;
+    const x = Math.min(clientX + 12, window.innerWidth - w - 8);
+    const y = clientY + 16 + h > window.innerHeight ? clientY - h - 10 : clientY + 16;
+    tlTip.style.left = Math.max(6, x) + 'px';
+    tlTip.style.top = Math.max(6, y) + 'px';
+  }
+
+  function tlSpanAt(index) {
+    if (tlModel === null) return null;
+    for (const s of tlModel.spans) {
+      if (s.index === index) return s;
+    }
+    return null;
+  }
+
+  function tlNearestIndex(time) {
+    if (tlModel === null) return null;
+    let best = null, bestGap = Infinity;
+    for (const s of tlModel.spans) {
+      const gap = time < s.start ? s.start - time : time > s.end ? time - s.end : 0;
+      if (gap < bestGap) { bestGap = gap; best = s.index; }
+    }
+    return best;
+  }
+
+  function tlSelectRecord(index) {
+    let node = tlIndexToNode.get(index);
+    // 目标被折叠了就先展开整轮,再定位(否则点击时间轴会没有反应)
+    if (node === undefined && collapsedRequests.size > 0) {
+      const request = feedEvents[index] === undefined ? undefined : feedEvents[index].request;
+      if (request !== undefined && collapsedRequests.has(request)) {
+        collapsedRequests.delete(request);
+        if (curData) renderFeed(curData);
+        node = tlIndexToNode.get(index);
+      }
+    }
+    tlSpanEls.forEach((spanEl, i) => {
+      if (i === index) spanEl.dataset.current = 'true';
+      else spanEl.removeAttribute('data-current');
+    });
+    if (node) node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  function tlClearSelection() {
+    tlRange = null;
+    tlDraft = null;
+    tlUpdateSelection();
+    tlApplyLedgerFilter();
+  }
+
+  function tlCenterRange(center) {
+    const d = tlDomain();
+    const width = Math.min(Math.min(d.duration, d.full / Math.max(1, tlModel.spans.length)), d.full);
+    const start = Math.min(Math.max(center - width / 2, tlModel.start), Math.max(tlModel.start, tlModel.end - width));
+    return { start: start, end: start + width };
+  }
+
+  /** 当前模式在 TL_MODES 中的下标 */
+  function tlModeIndex() {
+    for (let i = 0; i < TL_MODES.length; i++) {
+      if (TL_MODES[i].duration === tlOpts.duration && TL_MODES[i].time === tlOpts.time) return i;
+    }
+    return 0;
+  }
+
+  /** 同步模式按钮文案与提示,并记住选择 */
+  function tlSyncModeButton() {
+    if (tlDom === null) return;
+    const mode = TL_MODES[tlModeIndex()];
+    tlDom.modeLabel.textContent = mode.label;
+    tlDom.modeBtn.title = '投影模式:' + mode.label + '(' + mode.hint + ')\\n点击切换到下一个模式';
+    tlDom.modeBtn.setAttribute('aria-label', '投影模式 ' + mode.label + ',点击切换');
+    saveState({ tlMode: mode.key });
+  }
+
+  /** 重建色块与分界线(会话切换或模式切换时调用;缩放/平移只改 CSS 变量) */
+  function tlRebuild() {
+    if (tlDom === null) return;
+    tlSyncModeButton();
+    tlDom.projected.textContent = '';
+    tlDom.hline.style.display = 'none';
+    tlSpanEls = new Map();
+    tlModel = deriveModel();
+    if (tlModel === null) {
+      tlDom.empty.style.display = '';
+      tlDom.sel.style.display = 'none';
+      tlDom.edges.style.display = 'none';
+      tlDom.chip.style.display = 'none';
+      return;
+    }
+    tlDom.empty.style.display = 'none';
+    const full = Math.max(1, tlModel.end - tlModel.start);
+    const turns = el('div', 'tl-turns');
+    for (const b of tlModel.turnBounds) {
+      if (b.time <= tlModel.start) continue;
+      const line = el('span', 'tl-turn');
+      line.dataset.request = String(b.request);
+      line.style.setProperty('--tl-turn-left', ((b.time - tlModel.start) / full * 100).toFixed(4) + '%');
+      turns.appendChild(line);
+    }
+    const domain = el('div', 'tl-domain');
+    for (const s of tlModel.spans) {
+      const spanEl = el('span', 'tl-span');
+      spanEl.dataset.kind = s.kind;
+      spanEl.dataset.tlIndex = String(s.index);
+      if (tlOpts.time && !tlOpts.duration) spanEl.dataset.equal = 'true';
+      if (s.ev.exitCode !== undefined && s.ev.exitCode !== 0) spanEl.dataset.error = 'true';
+      const wp = (s.end - s.start) / full * 100;
+      spanEl.style.setProperty('--tl-span-left', ((s.start - tlModel.start) / full * 100).toFixed(4) + '%');
+      spanEl.style.setProperty('--tl-span-width', wp.toFixed(4) + '%');
+      spanEl.style.setProperty('--tl-span-gap', 'min(' + (wp * 0.08).toFixed(4) + '%, 1px)');
+      spanEl.style.setProperty('--tl-span-lane', String(s.lane));
+      tlSpanEls.set(s.index, spanEl);
+      domain.appendChild(spanEl);
+    }
+    tlDom.projected.appendChild(turns);
+    tlDom.projected.appendChild(domain);
+    tlUpdateProjection();
+    tlUpdateSelection();
+    tlApplyLedgerFilter();
+  }
+
+  function tlFractionAt(clientX, rect) {
+    return Math.min(1, Math.max(0, (clientX - rect.left) / Math.max(1, rect.width)));
+  }
+
+  function tlIndexAt(target) {
+    const node = target instanceof HTMLElement ? target.closest('[data-tl-index]') : null;
+    if (node === null) return null;
+    const n = Number(node.dataset.tlIndex);
+    return isFinite(n) ? n : null;
+  }
+
+  /** 会话数据 → 总览轴(骨架只建一次,后续按模式重建色块) */
+  function buildTimeline(data) {
+    tlDom = null;
+    tlEvents = [];
+    tlModel = null;
+    tlRange = null;
+    tlDraft = null;
+    tlDrag = null;
+    tlPan = null;
+    tlViewport = null;
+    tlIndexToNode = new Map();
+    tlHideTip();
+    for (let i = 0; i < data.events.length; i++) {
+      const ev = data.events[i];
+      if (ev.type === 'usage') continue;
+      ev.__i = i;
+      tlEvents.push(ev);
+    }
+    timelineRoot.textContent = '';
+
+    const bar = el('div', 'tl-bar');
+    const modeBtn = document.createElement('button');
+    modeBtn.type = 'button';
+    modeBtn.className = 'tl-mode-cycle';
+    modeBtn.appendChild(el('span', 'tl-mode-key', '模式'));
+    const modeLabel = el('span', 'tl-mode-label', '顺序');
+    modeBtn.appendChild(modeLabel);
+    modeBtn.addEventListener('click', () => {
+      const next = TL_MODES[(tlModeIndex() + 1) % TL_MODES.length];
+      tlOpts = { duration: next.duration, time: next.time };
+      tlViewport = null;
+      tlRebuild();
+    });
+    bar.appendChild(modeBtn);
+    bar.appendChild(el('span', 'spacer'));
+    const chip = el('span', 'tl-chip');
+    chip.style.display = 'none';
+    chip.title = '点击清除选区';
+    chip.addEventListener('click', () => tlClearSelection());
+    bar.appendChild(chip);
+    bar.appendChild(el('span', 'tl-hint', '滚轮缩放 · 拖动选区 · 右键拖动平移 · Esc 清除'));
+    timelineRoot.appendChild(bar);
+
+    const plot = el('div', 'tl-plot');
+    const labels = el('div', 'tl-labels');
+    labels.appendChild(el('span', '', '输入'));
+    labels.appendChild(el('span', '', '模型'));
+    labels.appendChild(el('span', '', '工具'));
+    plot.appendChild(labels);
+
+    const track = el('div', 'tl-track');
+    track.tabIndex = 0;
+    const sel = el('div', 'tl-sel');
+    const projected = el('div', 'tl-projected');
+    const edges = el('div', 'tl-sel-edges');
+    const hline = el('div', 'tl-hline');
+    const empty = el('div', 'tl-empty', '无可显示的事件');
+    track.appendChild(sel);
+    track.appendChild(projected);
+    track.appendChild(edges);
+    track.appendChild(hline);
+    track.appendChild(empty);
+    plot.appendChild(track);
+    timelineRoot.appendChild(plot);
+    tlDom = { track: track, sel: sel, projected: projected, edges: edges, hline: hline, empty: empty, chip: chip, modeBtn: modeBtn, modeLabel: modeLabel };
+
+    const domainTime = (fraction) => {
+      const d = tlDomain();
+      return d.start + fraction * d.duration;
+    };
+
+    // 滚轮缩放:以鼠标位置为锚点,只更新投影变量
+    track.addEventListener('wheel', (e) => {
+      if (tlModel === null) return;
+      e.preventDefault();
+      const rect = track.getBoundingClientRect();
+      const frac = tlFractionAt(e.clientX, rect);
+      const d = tlDomain();
+      const isSequence = !tlOpts.duration && !tlOpts.time;
+      const minDur = Math.min(isSequence ? 4 : 20, d.full);
+      const nextDur = Math.min(d.full, Math.max(minDur, d.duration * Math.exp(e.deltaY * 0.0015)));
+      if (nextDur >= d.full * 0.999) {
+        tlViewport = null;
+        tlUpdateProjection();
+        return;
+      }
+      const anchor = d.start + frac * d.duration;
+      const nextStart = Math.min(Math.max(anchor - frac * nextDur, tlModel.start), Math.max(tlModel.start, tlModel.end - nextDur));
+      tlViewport = { start: nextStart, end: nextStart + nextDur };
+      tlUpdateProjection();
+    }, { passive: false });
+
+    track.addEventListener('pointerdown', (e) => {
+      if (tlModel === null) return;
+      if (e.button === 2) {
+        tlPan = { pointerId: e.pointerId, anchorX: e.clientX, anchorStart: tlDomain().start, moved: false, pannable: tlViewport !== null };
+        track.dataset.panning = 'true';
+        track.setPointerCapture(e.pointerId);
+        return;
+      }
+      if (e.button !== 0) return;
+      tlHideTip();
+      const rect = track.getBoundingClientRect();
+      const frac = tlFractionAt(e.clientX, rect);
+      tlDrag = { pointerId: e.pointerId, anchorTime: domainTime(frac), anchorX: e.clientX, index: tlIndexAt(e.target), rect: rect };
+      track.setPointerCapture(e.pointerId);
+      tlDraft = { start: tlDrag.anchorTime, end: tlDrag.anchorTime };
+      tlUpdateSelection();
+    });
+
+    track.addEventListener('pointermove', (e) => {
+      if (tlModel === null) return;
+      const rect = track.getBoundingClientRect();
+      if (tlPan !== null && tlPan.pointerId === e.pointerId) {
+        if (Math.abs(e.clientX - tlPan.anchorX) >= TL_MIN_DRAG_PX) tlPan.moved = true;
+        if (!tlPan.pannable) return;
+        const d = tlDomain();
+        const delta = (e.clientX - tlPan.anchorX) / Math.max(1, rect.width);
+        const nextStart = Math.min(Math.max(tlPan.anchorStart - delta * d.duration, tlModel.start), Math.max(tlModel.start, tlModel.end - d.duration));
+        tlViewport = { start: nextStart, end: nextStart + d.duration };
+        tlUpdateProjection();
+        return;
+      }
+      const frac = tlFractionAt(e.clientX, rect);
+      const index = tlIndexAt(e.target);
+      if (tlDrag === null) {
+        if (index === null) {
+          tlHideTip();
+          hline.style.display = '';
+          hline.style.setProperty('--tl-hover-left', (frac * 100).toFixed(4) + '%');
+        } else {
+          hline.style.display = 'none';
+          if (tlTipIndex !== index) {
+            tlHideTip();
+            tlTipIndex = index;
+            const span = tlSpanAt(index);
+            const cx = e.clientX, cy = e.clientY;
+            if (span) {
+              tlTipTimer = setTimeout(() => { tlTipTimer = null; tlShowTip(span, cx, cy); }, TL_TIP_DELAY_MS);
+            }
+          }
+        }
+        return;
+      }
+      if (tlDrag.pointerId !== e.pointerId) return;
+      let domainStart = tlDomain().start;
+      if (tlViewport !== null) {
+        // 拖到边缘附近自动平移,越靠边越快
+        const localX = e.clientX - rect.left;
+        const edge = Math.min(TL_EDGE_MAX_PX, Math.max(1, rect.width * TL_EDGE_ZONE_FRACTION));
+        const dir = localX < edge ? -1 : localX > rect.width - edge ? 1 : 0;
+        if (dir !== 0) {
+          const dist = dir < 0 ? edge - localX : localX - (rect.width - edge);
+          const strength = Math.min(1, Math.max(0, dist / edge));
+          const d = tlDomain();
+          const desired = domainStart + dir * d.duration * TL_EDGE_STEP_FRACTION * Math.max(0.2, strength);
+          const nextStart = Math.min(Math.max(desired, tlModel.start), Math.max(tlModel.start, tlModel.end - d.duration));
+          if (nextStart !== domainStart) {
+            tlViewport = { start: nextStart, end: nextStart + d.duration };
+            tlUpdateProjection();
+            domainStart = nextStart;
+          }
+        }
+      }
+      const point = domainStart + frac * tlDomain().duration;
+      tlDraft = { start: Math.min(tlDrag.anchorTime, point), end: Math.max(tlDrag.anchorTime, point) };
+      tlUpdateSelection();
+    });
+
+    track.addEventListener('pointerup', (e) => {
+      if (tlModel === null) return;
+      if (tlPan !== null && tlPan.pointerId === e.pointerId) {
+        const moved = tlPan.moved || Math.abs(e.clientX - tlPan.anchorX) >= TL_MIN_DRAG_PX;
+        tlPan = null;
+        track.removeAttribute('data-panning');
+        if (!moved) tlClearSelection();
+        return;
+      }
+      if (tlDrag === null || tlDrag.pointerId !== e.pointerId) return;
+      const rect = track.getBoundingClientRect();
+      const frac = tlFractionAt(e.clientX, rect);
+      const d = tlDomain();
+      const point = d.start + frac * d.duration;
+      const drag = tlDrag;
+      tlDrag = null;
+      tlDraft = null;
+      const click = Math.abs(e.clientX - drag.anchorX) < TL_MIN_DRAG_PX;
+      if (click && drag.index !== null) {
+        tlClearSelection();
+        tlSelectRecord(drag.index);
+        return;
+      }
+      const start = Math.min(drag.anchorTime, point);
+      const end = Math.max(drag.anchorTime, point);
+      const minRange = Math.min(d.duration, d.full / Math.max(1, tlModel.spans.length));
+      if (end - start < minRange) {
+        const center = click ? start : (start + end) / 2;
+        tlRange = tlCenterRange(center);
+        if (click) {
+          const nearest = tlNearestIndex(center);
+          if (nearest !== null) tlSelectRecord(nearest);
+        }
+      } else {
+        tlRange = { start: start, end: end };
+      }
+      tlUpdateSelection();
+      tlApplyLedgerFilter();
+    });
+
+    track.addEventListener('pointercancel', () => {
+      tlDrag = null;
+      tlPan = null;
+      tlDraft = null;
+      track.removeAttribute('data-panning');
+      tlUpdateSelection();
+      tlHideTip();
+    });
+    track.addEventListener('pointerleave', () => {
+      if (tlDrag === null && tlPan === null) {
+        hline.style.display = 'none';
+        tlHideTip();
+      }
+    });
+    track.addEventListener('dblclick', (e) => {
+      e.preventDefault();
+      tlClearSelection();
+    });
+    track.addEventListener('contextmenu', (e) => e.preventDefault());
+    track.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && tlRange !== null) {
+        e.preventDefault();
+        tlClearSelection();
+      }
+    });
+
+    tlRebuild();
   }
 
   /** 当前会话上下文(供"来源"区块展示) */
@@ -603,15 +1261,26 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
     return s.replace(/\`[^\`]*\`/g, '〈指令〉').replace(/\s+/g, ' ').trim();
   }
 
+  /** 有界单行预览(借鉴 DSH trajectoryPreviewText):先截源文本再处理,成本有硬上限 */
+  const PREVIEW_SOURCE_CHARS = 2048;
+  function previewOf(text, limit) {
+    const full = text === undefined || text === null ? '' : String(text);
+    const source = full.slice(0, PREVIEW_SOURCE_CHARS);
+    const compact = source.replace(/[>*_#\[\]]/g, '').replace(/\s+/g, ' ').trim();
+    const preview = compact.slice(0, limit).trimEnd();
+    return source.length < full.length || preview.length < compact.length ? preview + '…' : preview;
+  }
+
   function summaryText(ev) {
     if (ev.type === 'usage') {
       return '输入 ' + fmtTok(ev.promptTokens) + ' · 输出 ' + fmtTok(ev.completionTokens);
     }
     const t = (ev.text || '').trim();
     if (!t) return '(空)';
-    let s = ev.type === 'tool' ? stripBackticks(t) : t.replace(/\s+/g, ' ');
-    const max = ev.type === 'thinking' ? 80 : 140;
-    return s.length > max ? s.slice(0, max) + '…' : s;
+    if (ev.type === 'tool') {
+      return previewOf(stripBackticks(t), 140);
+    }
+    return previewOf(t, ev.type === 'thinking' ? 80 : 140);
   }
 
   /** token 数格式化:k/M 缩写 */
@@ -742,29 +1411,35 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
     panes.source = sc;
 
     const defs = [['概述', 'overview'], ['预览', 'preview'], ['原始内容', 'raw'], ['来源', 'source']];
-    defs.forEach(([label, key], i) => {
-      const b = el('button', 'dtab' + (i === 0 ? ' active' : ''), label);
+    // 标签记忆(借鉴 DSH):默认打开上次查看过的标签
+    const initialTab = defs.some(([, key]) => key === detailTab) ? detailTab : 'overview';
+    defs.forEach(([label, key]) => {
+      const b = el('button', 'dtab' + (key === initialTab ? ' active' : ''), label);
       b.addEventListener('click', () => {
         tabs.querySelectorAll('.dtab').forEach((x) => x.classList.remove('active'));
         b.classList.add('active');
         paneWrap.textContent = '';
         paneWrap.appendChild(panes[key]);
+        detailTab = key;
+        saveState({ detailTab: key });
       });
       tabs.appendChild(b);
     });
-    paneWrap.appendChild(panes.overview);
+    paneWrap.appendChild(panes[initialTab]);
     detail.appendChild(tabs);
     detail.appendChild(paneWrap);
     return detail;
   }
 
-  function tlNode(ev) {
+  function tlNode(ev, index) {
     // 用量事件不单独渲染,而是聚合后显示在每个节点的 meta 区
     if (ev.type === 'usage') {
       return null;
     }
     const node = el('div', 'tl-node n-' + ev.type);
     node.id = 'req-anchor-' + ev.request;
+    node.dataset.tlIndex = String(index);
+    tlIndexToNode.set(index, node);
     const rail = el('div', 'tl-rail');
     rail.appendChild(el('span', 'dot'));
     node.appendChild(rail);
@@ -788,11 +1463,26 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
       summary.appendChild(el('span', 's-type', ev.toolId));
     }
     summary.appendChild(el('span', '', summaryText(ev)));
-    summary.title = '点击展开完整内容';
+    // 行内结果:同一条工具记录直接带上返回(借鉴 DSH 的"摘要 → 结果")
+    const resultInfo = toolResultInfo.get(index);
+    if (resultInfo !== undefined) {
+      summary.appendChild(el('span', 's-arrow', '→'));
+      summary.appendChild(el('span', 's-result' + (resultInfo.error ? ' err' : ''), resultInfo.text));
+    }
+    summary.title = '单击展开完整内容 · 双击折叠本轮';
+    summary.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      toggleRequestFold(ev.request);
+    });
     body.appendChild(summary);
-    const detail = buildDetail(ev);
-    body.appendChild(detail);
+    // 明细面板延迟到首次展开时才构建:既让"标签记忆"对每条都生效,也避免为上千行预建 4 个面板
+    let detail = null;
     summary.addEventListener('click', () => {
+      if (detail === null) {
+        detail = buildDetail(ev);
+        body.appendChild(detail);
+      }
       detail.classList.toggle('open');
     });
     node.appendChild(body);
@@ -801,20 +1491,101 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
 
   function renderEvents(data) {
     curData = data;
-    buildGantt(data);
+    if (feedSessionId !== data.sid) {
+      feedSessionId = data.sid;
+      collapsedRequests.clear();
+    }
+    buildTimeline(data);
+    renderFeed(data);
+  }
+
+  /** 工具调用索引 → 行内结果预览(同轮次内先到先得) */
+  let toolResultInfo = new Map();
+
+  function syncFoldButton() {
+    foldBtn.style.display = '';
+    const active = collapsedRequests.size > 0;
+    foldBtn.textContent = active ? '展开轮次' : '折叠轮次';
+    foldBtn.title = active
+      ? '展开全部轮次(恢复逐条显示)'
+      : '折叠轮次:每轮只留首条 + 折叠摘要行';
+  }
+
+  /** 单轮折叠切换 */
+  function toggleRequestFold(request) {
+    if (collapsedRequests.has(request)) collapsedRequests.delete(request);
+    else collapsedRequests.add(request);
+    if (curData) renderFeed(curData);
+  }
+
+  /** 工具栏总开关:有展开的轮次就全折,否则全展 */
+  function toggleAllFolds() {
+    if (!curData) return;
+    const counts = new Map();
+    for (const e of curData.events) {
+      if (e.type === 'usage') continue;
+      counts.set(e.request, (counts.get(e.request) || 0) + 1);
+    }
+    const foldable = [];
+    counts.forEach((n, request) => { if (n > 1) foldable.push(request); });
+    // 与按钮文案一致:已有折叠就全部展开,否则全部折叠
+    const active = collapsedRequests.size > 0;
+    collapsedRequests.clear();
+    if (!active) {
+      for (const r of foldable) collapsedRequests.add(r);
+    }
+    renderFeed(curData);
+  }
+
+  /** 折叠摘要行(合成行:点击展开整轮) */
+  function foldedRow(row) {
+    const node = el('div', 'tl-node n-folded');
+    const rail = el('div', 'tl-rail');
+    rail.appendChild(el('span', 'dot'));
+    node.appendChild(rail);
+    const meta = el('div', 'tl-meta');
+    meta.appendChild(el('div', 't', '轮次 #' + row.foldedRequest));
+    meta.appendChild(el('span', 'badge b-folded', '已折叠'));
+    node.appendChild(meta);
+    const body = el('div', 'tl-body');
+    const summary = el('div', 'summary-row folded');
+    summary.appendChild(el('span', 's-icon', '…'));
+    summary.appendChild(el('span', '', '折叠了 ' + row.count + ' 个事件'
+      + (row.tools > 0 ? ' · ' + row.tools + ' 次工具调用' : '')
+      + '(点击展开整轮)'));
+    summary.title = '点击展开整轮';
+    summary.addEventListener('click', () => {
+      collapsedRequests.delete(row.foldedRequest);
+      if (curData) renderFeed(curData);
+    });
+    body.appendChild(summary);
+    node.appendChild(body);
+    return node;
+  }
+
+  /** 账本渲染:标题 / 统计 / 对话块;feedOrder 决定对话块按时间升序或降序 */
+  function renderFeed(data) {
     feedTitle.textContent = data.title;
-    feedMeta.textContent = '会话 ' + data.sid + ' · ' + data.time + ' · ' + data.total + ' 条事件' + (data.model ? ' · 模型 ' + data.model : '') + (data.total > data.events.length ? ' · 仅显示前 ' + data.events.length + ' 条' : '');
+    feedOrderBtn.style.display = '';
+    feedOrderBtn.textContent = feedOrder === 'asc' ? '时间 ↑' : '时间 ↓';
+    feedOrderBtn.title = feedOrder === 'asc'
+      ? '对话块按时间升序(旧 → 新),点击切换为降序'
+      : '对话块按时间降序(新 → 旧),点击切换为升序';
+    feedMeta.textContent = '会话 ' + data.sid + ' · ' + data.time + ' · ' + data.total + ' 条事件' + (data.model ? ' · 模型 ' + data.model : '') + (data.total > data.events.length ? ' · 仅显示最近 ' + data.events.length + ' 条' : '');
     feedBody.textContent = '';
     if (data.events.length === 0) { feedStats.textContent = ''; feedBody.appendChild(el('div', 'empty', '该会话还没有可显示的事件')); return; }
     const nTool = data.events.filter(e => e.type === 'tool').length;
     const nResult = data.events.filter(e => e.type === 'toolResult').length;
     const maxReq = data.events.reduce((m, e) => Math.max(m, e.request), 0);
-    // 活跃时长:仅按会话实际活动事件(排除手动注释等外部事件)的最小/最大时间
+    // 活动时长:排除手动注释/用量事件,按时间排序后累加间隔,超长空闲(挂机)不计入
     let t0 = Infinity, t1 = -Infinity;
+    const stamps = [];
     for (const e of data.events) {
       if (e.type === 'note' || e.type === 'usage') continue;
+      if (!(typeof e.time === 'number' && e.time > 0)) continue;
       if (e.time < t0) t0 = e.time;
       if (e.time > t1) t1 = e.time;
+      stamps.push(e.time);
     }
     // 聚合每轮 token 用量
     usageByReq = new Map();
@@ -824,7 +1595,17 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
       }
     }
     const parts = [];
-    if (isFinite(t0)) parts.push('🕒 时长 ' + (t1 > t0 ? fmtDuration(t1 - t0) : '—'));
+    if (isFinite(t0)) {
+      stamps.sort((a, b) => a - b);
+      let active = 0;
+      for (let i = 1; i < stamps.length; i++) {
+        active += Math.min(stamps[i] - stamps[i - 1], TL_IDLE_GAP_MS);
+      }
+      parts.push('🕒 活跃 ' + (active > 0 ? fmtDuration(active) : '—'));
+      if (t1 > t0) parts.push('📏 跨度 ' + fmtDuration(t1 - t0));
+    } else {
+      parts.push('🕒 活跃 —');
+    }
     parts.push('💬 ' + maxReq + ' 轮');
     if (nTool > 0) parts.push('🔧 ' + nTool + ' 次调用');
     if (nResult > 0) parts.push('✅ ' + nResult + ' 条结果');
@@ -834,15 +1615,84 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
     parts.push('Σ ' + data.events.length + ' 事件');
     feedStats.textContent = '';
     parts.forEach((p) => feedStats.appendChild(el('b', '', p)));
-    const tl = el('div', 'tl');
-    for (const ev of data.events) {
-      const n = tlNode(ev);
-      if (n) {
-        tl.appendChild(n);
+    syncFoldButton();
+
+    // 工具调用 → 结果 配对(同轮次内先到先得),供行内"→ 结果"预览
+    feedEvents = data.events;
+    toolResultInfo = new Map();
+    const pendingTools = new Map();
+    for (let i = 0; i < feedEvents.length; i++) {
+      const e = feedEvents[i];
+      if (e.type === 'tool') {
+        const queue = pendingTools.get(e.request) || [];
+        queue.push(i);
+        pendingTools.set(e.request, queue);
+      } else if (e.type === 'toolResult') {
+        const queue = pendingTools.get(e.request);
+        if (queue && queue.length > 0) {
+          toolResultInfo.set(queue.shift(), {
+            text: previewOf(e.text || '', 120),
+            error: typeof e.exitCode === 'number' && e.exitCode !== 0,
+          });
+        }
       }
     }
-    feedBody.appendChild(tl);
-    feedBody.scrollTop = feedBody.scrollHeight;
+    tlIndexToNode = new Map();
+    // 对话块顺序:按事件时间排序(同一时间回退到 seq)。
+    // 事件时间并非严格随 seq 递增(思考 id、工具轮次各有真实时间),所以不能用 seq 反序冒充时间倒序。
+    const order = [];
+    for (let i = 0; i < data.events.length; i++) {
+      order.push(i);
+    }
+    order.sort((a, b) => {
+      const ta = data.events[a].time;
+      const tb = data.events[b].time;
+      const ha = typeof ta === 'number' && ta > 0;
+      const hb = typeof tb === 'number' && tb > 0;
+      let cmp;
+      if (ha && hb) {
+        cmp = ta === tb ? a - b : ta - tb;
+      } else if (ha !== hb) {
+        cmp = ha ? -1 : 1;
+      } else {
+        cmp = a - b;
+      }
+      return feedOrder === 'asc' ? cmp : -cmp;
+    });
+    // 整轮折叠投影(借鉴 DSH:折叠在数据层做,渲染逻辑不分叉)
+    const rows = [];
+    for (const i of order) {
+      const e = data.events[i];
+      if (e.type === 'usage') continue;
+      if (collapsedRequests.has(e.request)) {
+        const prev = rows[rows.length - 1];
+        if (prev !== undefined && prev.foldedRequest === e.request) {
+          prev.count += 1;
+          if (e.type === 'tool') prev.tools += 1;
+          continue;
+        }
+        if (prev !== undefined && prev.index !== undefined
+          && data.events[prev.index].request === e.request) {
+          rows.push({ foldedRequest: e.request, count: 1, tools: e.type === 'tool' ? 1 : 0 });
+          continue;
+        }
+      }
+      rows.push({ index: i });
+    }
+    const list = el('div', 'tl');
+    for (const row of rows) {
+      if (row.foldedRequest !== undefined) {
+        list.appendChild(foldedRow(row));
+      } else {
+        const n = tlNode(data.events[row.index], row.index);
+        if (n) {
+          list.appendChild(n);
+        }
+      }
+    }
+    feedBody.appendChild(list);
+    tlApplyLedgerFilter();
+    feedBody.scrollTop = feedOrder === 'desc' ? 0 : feedBody.scrollHeight;
   }
 
   function setRecording(on) {
@@ -865,6 +1715,19 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
   });
 
   $('search').addEventListener('input', (e) => renderList(e.target.value));
+  listOrderBtn.addEventListener('click', () => {
+    listOrder = listOrder === 'asc' ? 'desc' : 'asc';
+    saveState({ listOrder: listOrder });
+    renderList($('search').value);
+  });
+  feedOrderBtn.addEventListener('click', () => {
+    feedOrder = feedOrder === 'asc' ? 'desc' : 'asc';
+    saveState({ feedOrder: feedOrder });
+    if (curData) {
+      renderFeed(curData);
+    }
+  });
+  foldBtn.addEventListener('click', () => { toggleAllFolds(); });
   toggleBtn.addEventListener('click', () => vscode.postMessage({ type: 'toggleRecording' }));
   $('btn-refresh').addEventListener('click', () => vscode.postMessage({ type: 'refresh' }));
   $('btn-rebuild').addEventListener('click', () => vscode.postMessage({ type: 'rebuild', file: currentFile }));
@@ -875,14 +1738,7 @@ details.thinking .body { white-space: pre-wrap; opacity: .85; font-size: 12.5px;
   });
   $('note-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('btn-note').click(); });
 
-  // 窗口缩放时重新渲染时间总轴(自适应宽度)
-  let ganttResizeTimer = null;
-  window.addEventListener('resize', () => {
-    if (ganttResizeTimer) clearTimeout(ganttResizeTimer);
-    ganttResizeTimer = setTimeout(() => {
-      if (lastGanttData) buildGantt(lastGanttData);
-    }, 120);
-  });
+  // 总轴用百分比定位,窗口缩放无需重建(区别于旧的像素/分层实现)
 
   vscode.postMessage({ type: 'ready' });
 })();

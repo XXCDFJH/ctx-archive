@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Archive, type ArchiveHeader } from './archive';
-import { OtReplayer, type ArchiveEvent } from './otlog';
+import { OtReplayer, lineFingerprintKey, type ArchiveEvent } from './otlog';
 
 export interface RebuildReport {
   total: number;
@@ -45,16 +45,19 @@ async function findSource(sid: string, knownSource?: string): Promise<string | n
   return null;
 }
 
-/** 全量重放原始日志,返回带原始时间戳的事件列表 */
-async function replaySource(source: string): Promise<{ events: ArchiveEvent[]; metaTitle?: string; metaModel?: string }> {
+/** 全量重放原始日志,返回带原始时间戳与来源指纹的事件列表 */
+async function replaySource(source: string, sid: string): Promise<{ events: ArchiveEvent[]; metaTitle?: string; metaModel?: string }> {
   const replayer = new OtReplayer(source);
   const content = await fs.promises.readFile(source, 'utf8');
   const events: ArchiveEvent[] = [];
+  // 与跟踪器用同一套指纹算法(sid 取归档会话 id,与跟踪器的文件名 sid 一致)
+  const counters = new Map<string, number>();
   for (const line of content.split('\n')) {
     if (!line.trim()) {
       continue;
     }
-    events.push(...replayer.process(line, 0));
+    const lineTrimmed = line.trim();
+    events.push(...replayer.process(lineTrimmed, 0, lineFingerprintKey(sid, lineTrimmed, counters)));
   }
   const meta = replayer.sessionMeta;
   return { events, metaTitle: meta?.title, metaModel: meta?.model };
@@ -81,19 +84,55 @@ export async function rebuildArchives(root: string): Promise<RebuildReport> {
         continue;
       }
 
-      const { events, metaTitle, metaModel } = await replaySource(source);
+      const { events, metaTitle, metaModel } = await replaySource(source, sid);
 
       // 保留旧归档中的手动注释(原始数据里不存在),按时间合并
       const notes: ArchiveEvent[] = old.events
         .filter((e) => e.type === 'note')
         .map((e) => ({ type: 'note' as const, request: e.request ?? 0, text: e.text ?? '', time: e.time }));
-      const merged = [...events, ...notes].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
+      // 并集而非替换:日志被 VS Code 压缩过时,旧归档里往往还有日志已不再提供的内容。
+      // 重建绝不能把归档变小,否则等于删数据(实测曾从 3915 条掉到 1562 条)。
+      const identity = (e: {
+        type: string; request?: number; text?: string; toolId?: string; command?: string; exitCode?: number;
+      }): string => [
+        e.type,
+        e.request ?? 0,
+        (e.text ?? '').slice(0, 120),
+        e.toolId ?? '',
+        (e.command ?? '').slice(0, 120),
+        e.exitCode === undefined ? '' : String(e.exitCode),
+      ].join('\u0000');
+      const seen = new Set(events.map(identity));
+      const preserved: ArchiveEvent[] = [];
+      for (const e of old.events) {
+        if (e.type === 'note') {
+          continue;
+        }
+        const id = identity(e);
+        if (seen.has(id)) {
+          continue;
+        }
+        seen.add(id);
+        const rest = { ...e } as Record<string, unknown>;
+        delete rest.v;
+        delete rest.seq; // seq 由重建过程重新分配
+        preserved.push(rest as unknown as ArchiveEvent);
+      }
+      const merged = [...events, ...preserved, ...notes].sort((a, b) => (a.time ?? 0) - (b.time ?? 0));
 
+      // 起始时间取最早的真实事件时间(而非旧文件/当前时刻)
+      let firstTime = 0;
+      for (const ev of merged) {
+        const t = ev.time;
+        if (typeof t === 'number' && t > 0 && (firstTime === 0 || t < firstTime)) {
+          firstTime = t;
+        }
+      }
       const header: ArchiveHeader = {
         v: 1,
         type: 'header',
         seq: 0,
-        time: old.header?.time ?? Date.now(),
+        time: firstTime > 0 ? firstTime : (old.header?.time ?? Date.now()),
         sid,
         title: metaTitle || old.header?.title,
         model: metaModel || old.header?.model,
@@ -102,9 +141,16 @@ export async function rebuildArchives(root: string): Promise<RebuildReport> {
 
       const lines: string[] = [JSON.stringify(header)];
       let seq = 1;
+      let lastKnown = header.time;
       for (const ev of merged) {
         const { time, ...rest } = ev;
-        lines.push(JSON.stringify({ v: 1, ...rest, seq, time: time ?? header.time }));
+        // 无时间的事件沿用最近已知时间,不能落回 header 时间(会产生跨天假时间)
+        const hasTime = typeof time === 'number' && time > 0;
+        const stamp = hasTime ? time : lastKnown;
+        if (stamp > lastKnown) {
+          lastKnown = stamp;
+        }
+        lines.push(JSON.stringify({ v: 1, ...rest, seq, time: stamp }));
         seq += 1;
       }
 
